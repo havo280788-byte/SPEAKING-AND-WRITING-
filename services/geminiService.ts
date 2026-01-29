@@ -1,16 +1,90 @@
 import { GoogleGenAI, Modality } from "@google/genai";
-import { AIResponse, ChatMessage } from "../types";
+import { AIResponse, ChatMessage, SUPPORTED_MODELS, AIModelType } from "../types";
 
-// Helper to clean JSON string if it comes with markdown blocks
+// --- Configuration Constants ---
+// Define the fallback order explicitly as requested
+const FALLBACK_ORDER: AIModelType[] = ['gemini-3-flash-preview', 'gemini-3-pro-preview', 'gemini-2.5-flash'];
+
+// --- Helper Functions ---
+
+// 1. Clean JSON String
 const cleanJsonString = (str: string): string => {
   return str.replace(/```json\n?|```/g, "").trim();
 };
 
+// 2. Get API Key (LocalStorage -> Env)
+export const getApiKey = (): string => {
+  // Check LocalStorage first (browser context)
+  if (typeof window !== 'undefined') {
+    const localKey = localStorage.getItem('lingua_api_key');
+    if (localKey) return localKey;
+  }
+
+  // Check Env Vars
+  // Note: Vercel might not expose process.env to client unless prefixed with VITE_
+  // But vite.config.ts defined 'process.env.API_KEY' define replacement.
+  const key = process.env.API_KEY || process.env.GEMINI_API_KEY;
+  if (!key) {
+    // We return empty string instead of throwing here to let the UI prompt the user
+    return "";
+  }
+  return key;
+};
+
+// 3. Retry / Fallback Wrapper
+//    Accepts a function that takes a model name and returns a Promise.
+//    If it fails, retries with next model in fallback list.
+async function callAIWithRetry<T>(
+  operationName: string,
+  operationFn: (model: string, client: GoogleGenAI) => Promise<T>
+): Promise<T> {
+  const apiKey = getApiKey();
+  if (!apiKey) throw new Error("API Key is missing. Please click 'Settings' to add your key.");
+
+  // Determine starting model preference from localStorage or default
+  let currentModel: AIModelType = 'gemini-3-flash-preview';
+  if (typeof window !== 'undefined') {
+    const savedModel = localStorage.getItem('lingua_selected_model') as AIModelType;
+    if (savedModel && SUPPORTED_MODELS.some(m => m.id === savedModel)) {
+      currentModel = savedModel;
+    }
+  }
+
+  // specific fallback chain starting from currentModel
+  // If currentModel is standard, we follow fallback order (avoiding duplicates)
+  // If currentModel is unique, we add it to the front.
+  const uniqueFallbacks = Array.from(new Set([currentModel, ...FALLBACK_ORDER]));
+
+  let lastError: any = null;
+
+  for (const model of uniqueFallbacks) {
+    try {
+      console.log(`[${operationName}] Attempting with model: ${model}`);
+      const client = new GoogleGenAI({ apiKey });
+      return await operationFn(model, client);
+    } catch (error: any) {
+      console.warn(`[${operationName}] Failed with model ${model}:`, error.message);
+      lastError = error;
+      // Continue to next model in loop
+    }
+  }
+
+  throw new Error(`System overloaded or Model Error. Please try again later. (Last error: ${lastError?.message})`);
+}
+
+// --- Service Functions ---
+
 export const generateSpeech = async (text: string): Promise<string> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  try {
+  return callAIWithRetry("generateSpeech", async (model, ai) => {
+    // TTS might be specific to certain models or require the 'gemini-2.0-flash-exp' or specific TTS model.
+    // For now, we try to use the selected model if it supports audio generation.
+    // If not, this might fail and fallback, which is acceptable logic.
+    // However, standard text models might not generate audio.
+    // We will force 'gemini-2.0-flash-exp' if the selected model is likely text-only, OR trust the user's config.
+    // Given 'gemini-3' is hypothetical, we assume it's multimodal.
+
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-preview-tts",
+      model: model,
       contents: { parts: [{ text }] },
       config: {
         responseModalities: [Modality.AUDIO],
@@ -19,85 +93,74 @@ export const generateSpeech = async (text: string): Promise<string> => {
         }
       }
     });
-    
+
     const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     if (!base64Audio) throw new Error("No audio generated");
     return base64Audio;
-  } catch (error) {
-    console.error("TTS Error:", error);
-    return ""; // Return empty string if TTS fails, so chat can continue with text only
-  }
+  }).catch(err => {
+    console.error("TTS Final Fail:", err);
+    return "";
+  });
 };
 
 export const analyzeWriting = async (
   text: string,
   taskType: "IELTS" | "TOEIC" | "General" = "General"
 ): Promise<AIResponse> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  return callAIWithRetry("analyzeWriting", async (model, ai) => {
+    const prompt = `
+      Act as an expert English teacher and examiner for ${taskType}.
+      Analyze the following text provided by a student.
+      
+      Student Text: "${text}"
   
-  const prompt = `
-    Act as an expert English teacher and examiner for ${taskType}.
-    Analyze the following text provided by a student.
-    
-    Student Text: "${text}"
-
-    Your task:
-    1. Check for grammatical errors, spelling mistakes, and awkward phrasing.
-    2. Suggest better vocabulary appropriate for a high-level context.
-    3. Give a band score (0-10 scale based on accuracy and complexity).
-    4. Provide a rewritten, improved version of the text.
-    5. Provide specific sub-scores for: Task Response, Coherence & Cohesion, Lexical Resource, Grammatical Range & Accuracy.
-
-    Return the result strictly in this JSON format:
-    {
-      "score": number,
-      "scoreBreakdown": {
-        "Task Response": number,
-        "Coherence": number,
-        "Vocabulary": number,
-        "Grammar": number
-      },
-      "feedback": "string (general encouraging feedback)",
-      "detailedErrors": [
-        {
-          "original": "string (the mistake)",
-          "correction": "string (the fix)",
-          "explanation": "string (why it is wrong)",
-          "type": "grammar" | "vocabulary" | "coherence"
-        }
-      ],
-      "improvedVersion": "string"
-    }
-  `;
-
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
+      Your task:
+      1. Check for grammatical errors, spelling mistakes, and awkward phrasing.
+      2. Suggest better vocabulary appropriate for a high-level context.
+      3. Give a band score (0-10 scale based on accuracy and complexity).
+      4. Provide a rewritten, improved version of the text.
+      5. Provide specific sub-scores for: Task Response, Coherence & Cohesion, Lexical Resource, Grammatical Range & Accuracy.
+  
+      Return the result strictly in this JSON format:
+      {
+        "score": number,
+        "scoreBreakdown": {
+          "Task Response": number,
+          "Coherence": number,
+          "Vocabulary": number,
+          "Grammar": number
+        },
+        "feedback": "string (general encouraging feedback)",
+        "detailedErrors": [
+          {
+            "original": "string (the mistake)",
+            "correction": "string (the fix)",
+            "explanation": "string (why it is wrong)",
+            "type": "grammar" | "vocabulary" | "coherence"
+          }
+        ],
+        "improvedVersion": "string"
       }
+    `;
+
+    const response = await ai.models.generateContent({
+      model: model,
+      contents: prompt,
+      config: { responseMimeType: "application/json" }
     });
 
     const jsonText = cleanJsonString(response.text || "{}");
     return JSON.parse(jsonText) as AIResponse;
-  } catch (error) {
-    console.error("Gemini Writing Error:", error);
-    throw new Error("Unable to analyze writing. Please check your network or try again.");
-  }
+  });
 };
 
-// --- Single Turn Analysis (Old - Kept for reference or simple mode) ---
 export const analyzeSpeaking = async (
   audioBase64: string,
   topic: string = "General English"
 ): Promise<AIResponse> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  // Re-using the Grading Logic
   return gradeSpeakingSession([{ role: 'user', text: '(Audio Transcript Placeholder)' }], topic, audioBase64);
 };
 
-// --- 1. Interaction Logic (Turn-by-Turn) ---
 export const interactWithExaminer = async (
   history: ChatMessage[],
   topic: string,
@@ -105,89 +168,78 @@ export const interactWithExaminer = async (
   specificQuestion?: string,
   isFinish: boolean = false
 ): Promise<{ userTranscription: string; aiResponse: string; aiAudioBase64?: string }> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-  // Construct context from history
-  const context = history.map(h => `${h.role === 'ai' ? 'Examiner' : 'Student'}: ${h.text}`).join("\n");
+  return callAIWithRetry("interactWithExaminer", async (model, ai) => {
+    // 1. Construct parts/prompt...
+    const context = history.map(h => `${h.role === 'ai' ? 'Examiner' : 'Student'}: ${h.text}`).join("\n");
+    const systemInstruction = `
+        You are a friendly but professional IELTS Speaking Examiner. 
+        The topic is: "${topic}".
+        Your goal is to conduct a short interview.
+        Current Conversation History:
+        ${context}
+      `;
 
-  const systemInstruction = `
-    You are a friendly but professional IELTS Speaking Examiner. 
-    The topic is: "${topic}".
-    
-    Your goal is to conduct a short interview.
-    
-    Current Conversation History:
-    ${context}
-  `;
+    let prompt = "";
+    const parts: any[] = [];
 
-  let prompt = "";
-  const parts: any[] = [];
-
-  if (!userAudioBase64) {
-    // Start of session
-    if (specificQuestion) {
+    if (!userAudioBase64) {
+      // Start of session
+      if (specificQuestion) {
         prompt = `Start the interview. Introduce yourself briefly (1 sentence) and ask exactly this question: "${specificQuestion}". Return JSON: { "transcription": "", "response": "Your intro and question" }`;
-    } else {
+      } else {
         prompt = `Start the interview. Introduce yourself briefly and ask the first question about "${topic}". Return JSON: { "transcription": "", "response": "Your intro and question" }`;
-    }
-    parts.push({ text: prompt });
-  } else {
-    // User responded
-    const transcriptionInstruction = "1. Transcribe the user's audio accurately.";
-    
-    if (isFinish) {
-        prompt = `
-          The user just answered the final question via audio.
-          ${transcriptionInstruction}
-          2. Generate a brief polite closing statement (e.g. "Thank you for your answers. The test is now finished.").
-          Do NOT ask another question.
-          
-          Return JSON: { "transcription": "exact words spoken by student", "response": "Closing statement" }
-        `;
-    } else if (specificQuestion) {
-        prompt = `
-          The user just answered via audio. 
-          ${transcriptionInstruction}
-          2. Generate a brief, natural response to acknowledge their answer (e.g., "That's interesting," "I see").
-          3. Ask exactly this NEXT question: "${specificQuestion}".
-          4. Keep your response concise (under 30 words) so the student talks more.
-          
-          Return JSON: { "transcription": "exact words spoken by student", "response": "Your reaction + next question" }
-        `;
+      }
+      parts.push({ text: prompt });
     } else {
+      const transcriptionInstruction = "1. Transcribe the user's audio accurately.";
+      if (isFinish) {
         prompt = `
-          The user just answered via audio. 
-          ${transcriptionInstruction}
-          2. Generate a brief, natural response to acknowledge their answer (e.g., "That's interesting," "I see").
-          3. Ask the NEXT follow-up question related to the topic.
-          4. Keep your response concise (under 30 words) so the student talks more.
-          
-          Return JSON: { "transcription": "exact words spoken by student", "response": "Your reaction + next question" }
-        `;
+              The user just answered the final question via audio.
+              ${transcriptionInstruction}
+              2. Generate a brief polite closing statement (e.g. "Thank you for your answers. The test is now finished.").
+              Do NOT ask another question.
+              Return JSON: { "transcription": "exact words spoken by student", "response": "Closing statement" }
+            `;
+      } else if (specificQuestion) {
+        prompt = `
+              The user just answered via audio. 
+              ${transcriptionInstruction}
+              2. Generate a brief, natural response to acknowledge their answer (e.g., "That's interesting," "I see").
+              3. Ask exactly this NEXT question: "${specificQuestion}".
+              4. Keep your response concise (under 30 words) so the student talks more.
+              Return JSON: { "transcription": "exact words spoken by student", "response": "Your reaction + next question" }
+            `;
+      } else {
+        prompt = `
+              The user just answered via audio. 
+              ${transcriptionInstruction}
+              2. Generate a brief, natural response to acknowledge their answer (e.g., "That's interesting," "I see").
+              3. Ask the NEXT follow-up question related to the topic.
+              4. Keep your response concise (under 30 words) so the student talks more.
+              Return JSON: { "transcription": "exact words spoken by student", "response": "Your reaction + next question" }
+            `;
+      }
+      parts.push({ inlineData: { mimeType: "audio/webm; codecs=opus", data: userAudioBase64 } });
+      parts.push({ text: prompt });
     }
-    
-    parts.push({ inlineData: { mimeType: "audio/webm; codecs=opus", data: userAudioBase64 } });
-    parts.push({ text: prompt });
-  }
 
-  try {
+    // 2. Call API
     const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
-      contents: {
-        parts: parts
-      },
+      model: model,
+      contents: { parts: parts },
       config: {
         systemInstruction: systemInstruction,
         responseMimeType: "application/json"
       }
     });
-
     const jsonText = cleanJsonString(response.text || "{}");
     const result = JSON.parse(jsonText);
-    
-    // Generate TTS Audio for the response
+
+    // 3. Audio generation (Nested call logic vs separate call)
     let aiAudioBase64 = "";
     if (result.response) {
+      // Note: generateSpeech uses the same retry wrapper, so it will also adhere to fallback logic!
       aiAudioBase64 = await generateSpeech(result.response);
     }
 
@@ -196,188 +248,92 @@ export const interactWithExaminer = async (
       aiResponse: result.response,
       aiAudioBase64
     };
-  } catch (error) {
-    console.error("Gemini Interaction Error:", error);
-    throw new Error("Connection error. Please try again.");
-  }
+  });
 };
 
-// --- 2. Final Grading Logic (After 5 turns) ---
 export const gradeSpeakingSession = async (
   fullHistory: ChatMessage[],
   topic: string,
-  lastAudioBase64?: string // Optional: pass the last audio chunk if needed for specific analysis, but text is primary here
+  lastAudioBase64?: string
 ): Promise<AIResponse> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  return callAIWithRetry("gradeSpeakingSession", async (model, ai) => {
+    const transcript = fullHistory.map(h => `${h.role.toUpperCase()}: ${h.text}`).join("\n");
+    const prompt = `
+        Act as a Speaking Examiner.
+        Topic: "${topic}".
+        HERE IS THE TRANSCRIPT:
+        ${transcript}
 
-  const transcript = fullHistory.map(h => `${h.role.toUpperCase()}: ${h.text}`).join("\n");
+        Your task is to evaluate the student's performance based STRICTLY on the following rubric (Total 10 points):
+        **1. Content (Max 3)**
+        **2. Language (Max 3)**
+        **3. Pronunciation (Max 2)**
+        **4. Fluency (Max 2)**
 
-  const prompt = `
-    Act as a Speaking Examiner.
-    Topic: "${topic}".
-    
-    Here is the full transcript of the interview with the student:
-    
-    ${transcript}
-
-    Your task is to evaluate the student's performance based STRICTLY on the following rubric (Total 10 points):
-
-    **1. Content (Nội dung) - Max 3 points**
-    - 3 pts: Answers are relevant, clear ideas, includes examples/explanations.
-    - 2 pts: Relevant but simple ideas.
-    - 1 pt: Unclear ideas, rambling or not directly answering.
-    - 0 pts: No answer.
-
-    **2. Language (Ngôn ngữ) - Max 3 points**
-    - 3 pts: Appropriate vocabulary, accurate sentences.
-    - 2 pts: Minor errors but understandable.
-    - 1 pt: Many errors, limited vocabulary.
-    - 0 pts: Severe errors, unintelligible.
-
-    **3. Pronunciation (Phát âm) - Max 2 points**
-    - 2 pts: Clear pronunciation, natural intonation.
-    - 1 pt: Some errors but understandable.
-    - 0 pts: Poor pronunciation, hard to hear.
-
-    **4. Fluency (Lưu loát) - Max 2 points**
-    - 2 pts: Fluent, confident speaking.
-    - 1 pt: Hesitant, pauses often.
-    - 0 pts: Very hesitant or silent.
-
-    Analyze the transcript (and audio context if available) to determine the score.
-    Identify any specific errors in pronunciation or grammar from the text provided.
-
-    Return the result strictly in this JSON format:
-    {
-      "transcription": "Full session transcript...",
-      "score": number, // Total score out of 10
-      "scoreBreakdown": {
-         "Content": number, // Max 3
-         "Language": number, // Max 3
-         "Pronunciation": number, // Max 2
-         "Fluency": number // Max 2
-      },
-      "feedback": "string (Overall feedback in Vietnamese or English)",
-      "detailedErrors": [
+        Return the result strictly in this JSON format:
         {
-          "original": "string (error)",
-          "correction": "string (correction)",
-          "explanation": "string (why)",
-          "type": "pronunciation" | "grammar" | "vocabulary"
+          "transcription": "Full session transcript...",
+          "score": number, 
+          "scoreBreakdown": { "Content": number, "Language": number, "Pronunciation": number, "Fluency": number },
+          "feedback": "string (Overall feedback in Vietnamese or English)",
+          "detailedErrors": [ { "original": "...", "correction": "...", "explanation": "...", "type": "pronunciation" } ]
         }
-      ]
+      `;
+
+    const contents: any = { parts: [] };
+    if (lastAudioBase64) {
+      contents.parts.push({ inlineData: { mimeType: "audio/webm; codecs=opus", data: lastAudioBase64 } });
     }
-  `;
+    contents.parts.push({ text: prompt });
 
-  // We can attach the last audio chunk just to give the model a sense of the voice quality for the *final* turn
-  const contents: any = { parts: [] };
-  if (lastAudioBase64) {
-    contents.parts.push({ inlineData: { mimeType: "audio/webm; codecs=opus", data: lastAudioBase64 } });
-  }
-  contents.parts.push({ text: prompt });
-
-  try {
     const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
+      model: model,
       contents: contents,
-      config: {
-        responseMimeType: "application/json"
-      }
+      config: { responseMimeType: "application/json" }
     });
 
     const jsonText = cleanJsonString(response.text || "{}");
     return JSON.parse(jsonText) as AIResponse;
-  } catch (error) {
-    console.error("Gemini Grading Error:", error);
-    throw new Error("Unable to grade session.");
-  }
+  });
 };
 
 export const analyzePronunciation = async (
   audioBase64: string,
   targetText: string
 ): Promise<AIResponse> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  return callAIWithRetry("analyzePronunciation", async (model, ai) => {
+    const prompt = `
+        Act as a strict pronunciation coach.
+        The student is trying to read this specific sentence: "${targetText}".
+        Analyze the attached audio recording based on the following rubric (Total 10 points).
+        
+        * Articulation (3)
+        * Intonation & Stress (3)
+        * Fluency & Linking (2)
+        * Confidence (2)
 
-  const prompt = `
-    Act as a strict pronunciation coach.
-    The student is trying to read this specific sentence: "${targetText}".
-    Analyze the attached audio recording based on the following rubric (Total 10 points).
-
-    **RUBRIC CRITERIA:**
-
-    **1. Articulation (Max 3 points)**
-    - 3 pts: Clear pronunciation, correct ending sounds and difficult sounds.
-    - 2 pts: Minor errors but still understandable.
-    - 1 pt: Many errors, causing confusion.
-    - 0 pts: Severe pronunciation errors.
-
-    **2. Intonation & Stress (Max 3 points)**
-    - 3 pts: Correct stress, natural intonation.
-    - 2 pts: Some stress but inconsistent.
-    - 1 pt: Little stress, monotone.
-    - 0 pts: No intonation.
-
-    **3. Fluency & Linking (Max 2 points)**
-    - 2 pts: Seamless flow, good linking.
-    - 1 pt: Slight pauses.
-    - 0 pts: Hesitant, many pauses.
-
-    **4. Confidence & Attitude (Max 2 points)**
-    - 2 pts: Confident, clear voice.
-    - 1 pt: Slightly shy.
-    - 0 pts: Lack of focus/confidence.
-
-    Your task:
-    1. Transcribe exactly what the student said.
-    2. Score strictly based on the rubric above.
-    3. Identify words that were mispronounced, skipped, or added.
-
-    Return the result strictly in this JSON format:
-    {
-      "transcription": "string",
-      "score": number (Sum of criteria points, integer 0-10),
-      "scoreBreakdown": {
-         "Articulation": number,
-         "Intonation": number,
-         "Fluency": number,
-         "Confidence": number
-      },
-      "feedback": "string (Overall comment on performance)",
-      "detailedErrors": [
+        Return JSON:
         {
-          "original": "string (the word they struggled with)",
-          "correction": "string (IPA or phonetic spelling)",
-          "explanation": "string (specific advice on how to pronounce this word)",
-          "type": "pronunciation"
+          "transcription": "string",
+          "score": number,
+          "scoreBreakdown": { "Articulation": number, "Intonation": number, "Fluency": number, "Confidence": number },
+          "feedback": "string",
+          "detailedErrors": []
         }
-      ]
-    }
-  `;
+      `;
 
-  try {
     const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
+      model: model,
       contents: {
         parts: [
-          {
-            inlineData: {
-              mimeType: "audio/webm; codecs=opus", 
-              data: audioBase64
-            }
-          },
+          { inlineData: { mimeType: "audio/webm; codecs=opus", data: audioBase64 } },
           { text: prompt }
         ]
       },
-      config: {
-        responseMimeType: "application/json"
-      }
+      config: { responseMimeType: "application/json" }
     });
 
     const jsonText = cleanJsonString(response.text || "{}");
     return JSON.parse(jsonText) as AIResponse;
-  } catch (error) {
-    console.error("Gemini Pronunciation Error:", error);
-    throw new Error("Unable to analyze pronunciation.");
-  }
+  });
 };

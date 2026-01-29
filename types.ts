@@ -47,3 +47,16 @@ export interface HistoryItem {
 export interface GeminiConfig {
   apiKey: string;
 }
+
+export type AIModelType = 'gemini-3-flash-preview' | 'gemini-3-pro-preview' | 'gemini-2.5-flash';
+
+export interface AIModelConfig {
+  selectedModel: AIModelType;
+  apiKey: string;
+}
+
+export const SUPPORTED_MODELS: { id: AIModelType; name: string; desc: string; isNew?: boolean }[] = [
+  { id: 'gemini-3-flash-preview', name: 'Gemini 3 Flash', desc: 'Fastest, low latency (Default)', isNew: true },
+  { id: 'gemini-3-pro-preview', name: 'Gemini 3 Pro', desc: 'High intelligence, complex tasks', isNew: true },
+  { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', desc: 'Balanced performance' },
+];
